@@ -5,29 +5,86 @@
 # Usage: make
 
 BLDDIR := $(CURDIR)/bld
-CLANG := /w/llvm/llvm/bld/install/bin/clang
-LLC := /w/llvm/llvm/bld/install/bin/llc
-OPT := /w/llvm/llvm/bld/install/bin/opt
-LLVM_LINK := /w/llvm/llvm/bld/install/bin/llvm-link
-LLVM_AS := /w/llvm/llvm/bld/install/bin/llvm-as
-LLVM_DIS := /w/llvm/llvm/bld/install/bin/llvm-dis
 TARGET := $(CURDIR)/bpfel-unknown-none-v4.json
 # Persistent across `rm -rf bld` — libcore/liballoc rebuilds dominate clean
 # builds (~22s), and these only depend on rustc/RUST_SRC, not on user code.
 DEPDIR := $(CURDIR)/bld_deps
-# System rustc + /usr/lib/rustlib/src can be mismatched (RHEL packaging splits
-# the compiler and source versions). Default to the locally-built toolchain
-# under /w/rust, overridable via env or `make RUSTC=... RUST_SRC=...`.
-RUSTC ?= /w/rust/build/x86_64-unknown-linux-gnu/stage1/bin/rustc
-RUST_SRC ?= /w/rust/library
-CARGO ?= cargo
-LLVM_PREFIX ?= /w/llvm/llvm/bld/install
-
-RUSTFLAGS_ENV := RUSTC_BOOTSTRAP=1
-RUSTC_COMMON := --target $(TARGET) -C opt-level=3 -C panic=unwind -C debuginfo=2 -Z unstable-options -Z threads=64
 
 # Host triple for proc-macro and bpf-postproc builds (default to current).
 HOST_TRIPLE ?= x86_64-unknown-linux-gnu
+
+# LLVM toolchain. LLVM_DIR is the ONLY knob: the command-line tools, the
+# llvm-sys prefix and the bpf-postproc feature are all derived from it below,
+# with `:=`, so there is no second variable that can drift out of sync and
+# point half the build at a different LLVM.
+#
+# LLVM_DIR must match the LLVM that RUSTC was built against (`rustc -vV`
+# prints it): rustc emits bitcode in its own LLVM's format, and an older
+# llvm-link rejects it outright with "error: Invalid record". The
+# check-toolchain rule below enforces that rather than letting it fail deep
+# in the pipeline.
+LLVM_DIR ?= /home/yhs/work/llvm-project/llvm/build.23
+LLVM_BIN := $(LLVM_DIR)/bin
+LLVM_CONFIG := $(LLVM_BIN)/llvm-config
+LLC := $(LLVM_BIN)/llc
+OPT := $(LLVM_BIN)/opt
+LLVM_LINK := $(LLVM_BIN)/llvm-link
+LLVM_AS := $(LLVM_BIN)/llvm-as
+LLVM_DIS := $(LLVM_BIN)/llvm-dis
+LLVM_OBJCOPY := $(LLVM_BIN)/llvm-objcopy
+
+# "23.1.0" -> LLVM_MAJOR 23, LLVM_MINOR 1. Trailing junk in development
+# versions ("24.0.0git") is harmless: only the first two fields are used.
+LLVM_VERSION := $(shell $(LLVM_CONFIG) --version 2>/dev/null)
+LLVM_MAJOR := $(word 1,$(subst ., ,$(LLVM_VERSION)))
+LLVM_MINOR := $(word 2,$(subst ., ,$(LLVM_VERSION)))
+# llvm-sys only honours LLVM_SYS_<crate major>_PREFIX for its OWN crate major
+# version, and that major is <LLVM major><LLVM minor> (LLVM 23.1 -> llvm-sys
+# 231.x -> LLVM_SYS_231_PREFIX). Any other name is ignored and llvm-sys
+# silently falls back to whatever llvm-config is on $PATH, linking
+# bpf-postproc against a foreign LLVM that then emits unreadable bitcode.
+LLVM_SYS_PREFIX_VAR := LLVM_SYS_$(LLVM_MAJOR)$(LLVM_MINOR)_PREFIX
+# Picks the matching optional llvm-sys dep in bpf-postproc/Cargo.toml.
+POSTPROC_FEATURE := llvm-$(LLVM_MAJOR)
+LLVM_STAMP := $(BLDDIR)/.llvm-dir
+
+# RUSTC and RUST_SRC must come from the SAME rustc version: libcore/liballoc
+# use lang items and built-in macros that only the exactly-matching compiler
+# knows about, so pairing a released toolchain with an unrelated rust checkout
+# fails outright (hundreds of errors in core). The nightly rustup toolchain
+# plus its own rust-src component is a matched pair by construction:
+#   rustup toolchain install nightly && rustup component add rust-src --toolchain nightly
+# To build against a rust git checkout instead, bootstrap it there
+# (`./configure && ./x.py build --stage 1 library`, there is no Makefile in
+# that tree) and override both:
+#   make RUSTC=<tree>/build/$(HOST_TRIPLE)/stage1/bin/rustc RUST_SRC=<tree>/library
+RUST_TOOLCHAIN ?= $(HOME)/.rustup/toolchains/nightly-$(HOST_TRIPLE)
+RUSTC ?= $(RUST_TOOLCHAIN)/bin/rustc
+RUST_SRC ?= $(RUST_TOOLCHAIN)/lib/rustlib/src/rust/library
+CARGO ?= cargo
+
+# The LLVM rustc was built with. A nightly bump can move this (22 -> 23 in
+# Aug 2026), at which point LLVM_DIR has to move with it.
+RUSTC_LLVM_VERSION := $(shell $(RUSTC) -vV 2>/dev/null | sed -n 's/^LLVM version: //p')
+RUSTC_LLVM_MAJOR := $(word 1,$(subst ., ,$(RUSTC_LLVM_VERSION)))
+
+# Fail fast, with something actionable, instead of surfacing as "Invalid
+# record" out of llvm-link or a compile_error! out of llvm-sys. Skipped for
+# the clean targets so they still work without a toolchain present.
+ifeq ($(filter clean distclean,$(MAKECMDGOALS)),)
+ifeq ($(LLVM_VERSION),)
+$(error no llvm-config at $(LLVM_CONFIG); set LLVM_DIR=<llvm build or install dir>)
+endif
+ifeq ($(RUSTC_LLVM_VERSION),)
+$(error cannot run $(RUSTC); set RUSTC=<path> or RUST_TOOLCHAIN=<dir>)
+endif
+ifneq ($(LLVM_MAJOR),$(RUSTC_LLVM_MAJOR))
+$(error LLVM mismatch: $(RUSTC) uses LLVM $(RUSTC_LLVM_VERSION) but LLVM_DIR=$(LLVM_DIR) is LLVM $(LLVM_VERSION). Point LLVM_DIR at an LLVM $(RUSTC_LLVM_MAJOR) build)
+endif
+endif
+
+RUSTFLAGS_ENV := RUSTC_BOOTSTRAP=1
+RUSTC_COMMON := --target $(TARGET) -C opt-level=3 -C panic=unwind -C debuginfo=2 -Z unstable-options -Z threads=64
 
 PROGS := scx_simple scx_cosmos
 
@@ -89,12 +146,24 @@ $(BLDDIR)/libbtf_macros.so: $(wildcard $(CURDIR)/btf-macros/src/*.rs) $(CURDIR)/
 # Lowers __btf_field_byte_offset / __btf_field_exists polyfills into
 # llvm.preserve.struct.access.index chains + llvm.bpf.preserve.field.info
 # calls so the BPF backend emits CO-RE relocations.
-$(BLDDIR)/bpf-postproc: $(wildcard $(CURDIR)/bpf-postproc/src/*.rs) $(CURDIR)/bpf-postproc/Cargo.toml
+#
+# $(LLVM_STAMP) forces a relink when LLVM_DIR changes: cargo would rebuild,
+# but make on its own would see the copy in $(BLDDIR) as up to date and keep
+# a bpf-postproc bound to the previous LLVM.
+$(BLDDIR)/bpf-postproc: $(wildcard $(CURDIR)/bpf-postproc/src/*.rs) $(CURDIR)/bpf-postproc/Cargo.toml $(LLVM_STAMP)
 	cd $(CURDIR)/bpf-postproc && \
-		LLVM_SYS_220_PREFIX=$(LLVM_PREFIX) \
-		$(CARGO) build --release
+		$(LLVM_SYS_PREFIX_VAR)=$(LLVM_DIR) \
+		$(CARGO) build --release --no-default-features --features $(POSTPROC_FEATURE)
 	@mkdir -p $(BLDDIR)
 	cp $(CURDIR)/bpf-postproc/target/release/bpf-postproc $@
+
+# Records LLVM_DIR, and is only touched when the recorded value actually
+# changes, so it does not force a rebuild on every invocation.
+.PHONY: force
+force:
+$(LLVM_STAMP): force
+	@mkdir -p $(BLDDIR)
+	@echo '$(LLVM_DIR)' | cmp -s - $@ 2>/dev/null || echo '$(LLVM_DIR)' > $@
 
 # --- Build BPF program bitcode ---
 $(BLDDIR)/%.bc: %.rs $(DEPDIR)/liballoc.rlib $(DEPDIR)/libbtf.rlib $(BLDDIR)/libbtf_macros.so
@@ -166,7 +235,7 @@ $(BLDDIR)/%-ksyms.bc: $(BLDDIR)/%-opt.bc
 # --- Final BPF object ---
 $(BLDDIR)/%.o: $(BLDDIR)/%-ksyms.bc
 	$(LLC) -march=bpfel -mcpu=v4 -filetype=obj -o $@.tmp $<
-	/w/llvm/llvm/bld/install/bin/llvm-objcopy \
+	$(LLVM_OBJCOPY) \
 		--remove-section=.eh_frame --remove-section=.rel.eh_frame \
 		--remove-section=.gcc_except_table \
 		--strip-symbol=rust_eh_personality $@.tmp $@
@@ -175,8 +244,11 @@ $(BLDDIR)/%.o: $(BLDDIR)/%-ksyms.bc
 clean:
 	rm -rf $(BLDDIR)
 
+# Also drops the cargo target/ trees for the two host tools; they are
+# gitignored but account for ~250M, far more than BLDDIR/DEPDIR combined.
 distclean: clean
 	rm -rf $(DEPDIR)
+	rm -rf $(CURDIR)/bpf-postproc/target $(CURDIR)/btf-macros/target
 
 .PRECIOUS: $(BLDDIR)/%.bc $(BLDDIR)/%-linked.bc $(BLDDIR)/%-reloc.bc $(BLDDIR)/%-opt.bc $(BLDDIR)/%-ksyms.bc
 
