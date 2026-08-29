@@ -3,9 +3,29 @@
 # declarations in LLVM IR so that LLC generates proper BTF FUNC entries.
 # Usage: add_ksyms.py input.ll output.ll
 
-import re, sys
+import os, re, sys
 
 text = open(sys.argv[1]).read()
+
+# The kernel only accepts BTF type names that are C identifiers, so a
+# monomorphised Rust name like "NonNull<u8>" makes the whole .BTF section
+# unloadable and takes func_info/line_info down with it.  Rewrite the offending
+# characters in the debug info the BTF is derived from.  Only type names are
+# touched; file names and linkage names do not reach BTF.
+if os.environ.get('KERNEL_BTF'):
+    def sanitize_name(m):
+        head, name = m.group(1), m.group(2)
+        fixed = re.sub(r'[^0-9A-Za-z_]', '_', name)
+        if fixed and fixed[0].isdigit():
+            fixed = '_' + fixed
+        return f'{head}"{fixed}"'
+
+    text = re.sub(
+        r'(!(?:DICompositeType|DIBasicType|DIDerivedType|DIEnumerator|'
+        r'DISubprogram)\([^)]*?\bname:\s*)"([^"]*)"',
+        sanitize_name,
+        text,
+    )
 
 # Find the highest existing metadata ID so we can append new ones.
 max_id = max((int(m[1:]) for m in re.findall(r'!\d+', text)), default=0)
@@ -18,6 +38,97 @@ di_file = di_file_match.group(1) if di_file_match else None
 new_metadata = []
 next_id = max_id + 1
 
+# With KERNEL_BTF set, the DISubroutineType of each kfunc mirrors the LLVM
+# declaration instead of being an empty void(void).  libbpf checks the BTF
+# prototype of every kfunc extern against the kernel's with
+# bpf_core_types_are_compat(), which compares the argument count first, so a
+# void(void) prototype makes any kfunc that takes arguments unloadable.
+#
+# Only void and integer arguments are reconstructed exactly.  A pointer
+# becomes a pointer to void, which is compatible with the kernel only when the
+# kfunc's own argument is void * -- reconstructing "struct task_struct *" and
+# friends would mean pulling the real types out of the kernel's BTF.
+#
+# Off by default so the LLVM 22 scx_* objects stay byte for byte what they
+# were.
+kernel_btf = bool(os.environ.get('KERNEL_BTF'))
+emit_protos = kernel_btf
+
+# Shared DI type nodes, keyed by LLVM type name.
+di_types = {}
+
+def di_type_for(llvm_ty):
+    """Metadata reference for an LLVM type, or None for void/unsupported."""
+    global next_id
+
+    if llvm_ty == 'void':
+        return None
+    if llvm_ty in di_types:
+        return di_types[llvm_ty]
+
+    m = re.fullmatch(r'i(\d+)', llvm_ty)
+    if m:
+        bits = int(m.group(1))
+        # BTF INT compatibility only looks at the bit offset, so an unsigned
+        # integer of the right width matches any kernel integer of that width.
+        node = f'!{next_id}'
+        new_metadata.append(
+            f'{node} = !DIBasicType(name: "__u{bits}", size: {bits}, '
+            f'encoding: DW_ATE_unsigned)')
+        next_id += 1
+    elif llvm_ty == 'ptr':
+        node = f'!{next_id}'
+        new_metadata.append(
+            f'{node} = !DIDerivedType(tag: DW_TAG_pointer_type, size: 64)')
+        next_id += 1
+    else:
+        return None
+
+    di_types[llvm_ty] = node
+    return node
+
+def split_args(args):
+    """Split a declare's argument list on top-level commas."""
+    out, depth, cur = [], 0, ''
+    for ch in args:
+        if ch in '([{<':
+            depth += 1
+        elif ch in ')]}>':
+            depth -= 1
+        if ch == ',' and depth == 0:
+            out.append(cur)
+            cur = ''
+        else:
+            cur += ch
+    if cur.strip():
+        out.append(cur)
+    return [a.strip() for a in out]
+
+def subroutine_types(line):
+    """'types:' list mirroring a declare's signature, or '!{null}'."""
+    m = re.match(r'declare\s+(?:!\S+\s+\S+\s+)*(.*?)\s*@[\w.$]+\((.*)\)', line)
+    if not m:
+        return '!{null}'
+
+    # The return type is the last word before the function name; anything
+    # before it is a parameter attribute (noundef, zeroext, ...).
+    ret_ty = m.group(1).split()[-1] if m.group(1).split() else 'void'
+    nodes = [di_type_for(ret_ty) or 'null']
+
+    for arg in split_args(m.group(2)):
+        words = arg.split()
+        if not words or words[0] == '...':
+            continue
+        node = di_type_for(words[0])
+        if not node:
+            # An argument we cannot describe would produce a prototype that is
+            # wrong rather than merely incomplete; leave the whole function
+            # undescribed instead.
+            return '!{null}'
+        nodes.append(node)
+
+    return '!{' + ', '.join(nodes) + '}'
+
 def add_ksyms(m):
     global next_id
     line = m.group(0)
@@ -25,6 +136,8 @@ def add_ksyms(m):
     # Extract function name.
     name_match = re.search(r'@(\w+)\(', line)
     name = name_match.group(1) if name_match else "unknown"
+
+    types = subroutine_types(line) if emit_protos else '!{null}'
 
     # Allocate metadata IDs: one for DISubprogram, one for DISubroutineType.
     dbg_id = next_id
@@ -37,7 +150,7 @@ def add_ksyms(m):
         f'file: {file_ref}, type: !{subrt_id}, '
         f'flags: DIFlagPrototyped, spFlags: DISPFlagOptimized)')
     new_metadata.append(
-        f'!{subrt_id} = !DISubroutineType(types: !{{null}})')
+        f'!{subrt_id} = !DISubroutineType(types: {types})')
 
     # Insert !dbg right after 'declare' and append section at the end.
     # declare !dbg !N <rest> #M section ".ksyms"
@@ -137,6 +250,9 @@ if re.search(r'^\s+resume\s', text, re.MULTILINE):
         f'!{dbg_id} = !DISubprogram(name: "_Unwind_Resume", scope: {file_ref}, '
         f'file: {file_ref}, type: !{subrt_id}, '
         f'flags: DIFlagPrototyped, spFlags: DISPFlagOptimized)')
+    # Deliberately void(void) even though the call passes the exception
+    # object: the kernel's _Unwind_Resume kfunc takes no arguments, and the
+    # verifier rewrites the call into a return before ever type checking it.
     new_metadata.append(
         f'!{subrt_id} = !DISubroutineType(types: !{{null}})')
     extra_decls.append(
@@ -168,7 +284,13 @@ text = re.sub(r'^attributes (#\d+) = \{\s*\}$',
               r'attributes \1 = { noinline }', text, flags=re.MULTILINE)
 
 # Convert 'invoke' to 'call' + 'br', dropping the unwind path.
-# BPF has no exception handling.
+#
+# LLVM < 23 has no BPF exception handling, so the unwind edge has nowhere to
+# go and the landing pads are dead weight. With KEEP_INVOKE=1 the invokes are
+# left alone instead: LLVM >= 23 lowers them itself and records every invoke
+# region in .bpf_cleanup (9d51c891b719 "[BPF] Add exception handling support
+# with .bpf_cleanup section"), which is what lets bpf_throw() find the Drop
+# cleanup code at run time.
 def lower_invoke(m):
     indent = m.group(1)
     ret_assign = m.group(2) or ''
@@ -179,17 +301,18 @@ def lower_invoke(m):
     return (f'{indent}{ret_assign}call {tail.rstrip()}{call_meta}\n'
             f'{indent}br label %{normal}{call_meta}')
 
-text = re.sub(
-    r'^(\s+)((?:%\S+\s*=\s*)?)'
-    r'invoke\s+'
-    r'(.*?)'
-    r'\s+to\s+label\s+%(\S+)'
-    r'\s+unwind\s+label\s+%\S+'
-    r'((?:,\s*!\w+\s+!\d+)*)$',
-    lower_invoke,
-    text,
-    flags=re.MULTILINE,
-)
+if not os.environ.get('KEEP_INVOKE'):
+    text = re.sub(
+        r'^(\s+)((?:%\S+\s*=\s*)?)'
+        r'invoke\s+'
+        r'(.*?)'
+        r'\s+to\s+label\s+%(\S+)'
+        r'\s+unwind\s+label\s+%\S+'
+        r'((?:,\s*!\w+\s+!\d+)*)$',
+        lower_invoke,
+        text,
+        flags=re.MULTILINE,
+    )
 
 # Replace 'unreachable' with 'ret'. 'ret' compiles to a BPF exit insn.
 # BPF verifier requires every subprogram to end with exit or jmp.
