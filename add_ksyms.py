@@ -538,7 +538,7 @@ text = re.sub(r'^attributes (#\d+) = \{\s*\}$',
 # go and the landing pads are dead weight. With KEEP_INVOKE=1 the invokes are
 # left alone instead: LLVM >= 23 lowers them itself and records every invoke
 # region in .bpf_cleanup (9d51c891b719 "[BPF] Add exception handling support
-# with .bpf_cleanup section"), which is what lets bpf_throw() find the Drop
+# with .bpf_cleanup section"), which is what lets bpf_unwind() find the Drop
 # cleanup code at run time.
 def lower_invoke(m):
     indent = m.group(1)

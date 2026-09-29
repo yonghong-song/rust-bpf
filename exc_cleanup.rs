@@ -18,13 +18,13 @@
 //! Each of them therefore gets an `invoke` + `landingpad cleanup` that runs the
 //! Drop impls (i.e. the "undo" kfunc calls) and then `resume`s, which lowers to
 //! `call _Unwind_Resume` - the kernel's bpf_unwind_resume kfunc, which libbpf
-//! maps that name onto.  bpf_throw() walks the frames and dispatches each one's
+//! maps that name onto.  bpf_unwind() walks the frames and dispatches each one's
 //! pad:
 //!
 //!   frame foo3: re-enable preemption   (bpf_preempt_enable)
 //!   frame foo2: leave the RCU section  (bpf_rcu_read_unlock), drop tracker
 //!   frame foo1: no cleanup entry -> the frame is just popped
-//!   frame entry: the exception boundary; the cookie becomes the retval
+//!   frame entry: the exception boundary
 //!
 //! Two things are required to get this out of rustc:
 //!
@@ -43,9 +43,8 @@
 //! that the kernel failed to make reachable, leaves the region unbalanced and
 //! the program does not load at all.  On top of that each Drop sets its own bit
 //! in PADS_RAN, so the value left in .bss names exactly the pads that ran.  A
-//! pad runs as a subroutine of bpf_throw() and the cookie it carries is
-//! untouched, so a side effect like this is the only way to see a pad from user
-//! space.
+//! pad runs as a subroutine of bpf_unwind(), so a side effect like this is
+//! the only way to see a pad from user space.
 //!
 //! Every kfunc used here takes either no arguments or integers, because the
 //! BTF prototypes in .ksyms are synthesised from the LLVM declaration and
@@ -64,10 +63,9 @@ use core::ptr::{read_volatile, write_volatile};
 // -- kfunc bindings --
 
 unsafe extern "C-unwind" {
-    /// Raises a BPF exception carrying @cookie.  Every frame with a matching
-    /// .bpf_cleanup entry runs its landing pad on the way out, and @cookie is
-    /// what the program returns at the exception boundary.
-    fn bpf_throw(cookie: u64) -> !;
+    /// Raises a BPF exception.  Every frame with a matching .bpf_cleanup
+    /// entry runs its landing pad on the way out.
+    fn bpf_unwind() -> !;
 }
 
 unsafe extern "C" {
@@ -77,9 +75,7 @@ unsafe extern "C" {
     fn bpf_preempt_enable();
 }
 
-/// Cookie the panic handler throws with.  Must match
-/// prog_tests/rust_exceptions.c, and so must the bits below.
-pub const THROW_COOKIE: u64 = 0x100;
+/// One bit per landing pad.  Must match prog_tests/rust_exceptions.c.
 pub const RAN_FOO3_PREEMPT: u64 = 0x1;
 pub const RAN_FOO2_RCU: u64 = 0x2;
 pub const RAN_FOO2_TRACKER: u64 = 0x4;
@@ -214,7 +210,7 @@ pub extern "C-unwind" fn entry(_ctx: *mut u8) -> i32 {
 /// A Rust panic turns into a BPF exception here.
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
-    unsafe { bpf_throw(THROW_COOKIE) }
+    unsafe { bpf_unwind() }
 }
 
 /// Referenced by every function with a landing pad; never actually called on

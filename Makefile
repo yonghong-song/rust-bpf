@@ -51,7 +51,7 @@ TAG_PROGS := type_tag_test decl_tag_test
 
 PROGS := scx_simple scx_cosmos $(TAG_PROGS)
 
-# Programs that let a bpf_throw() unwind through Rust Drop impls. These need
+# Programs that let a bpf_unwind() unwind through Rust Drop impls. These need
 # the .bpf_cleanup section, which only exists in LLVM >= 23 (9d51c891b719
 # "[BPF] Add exception handling support with .bpf_cleanup section"), so they
 # are only built when LLVM_PREFIX is new enough. An older backend has no
@@ -235,7 +235,7 @@ $(BLDDIR)/%.o: $(BLDDIR)/%-ksyms.bc
 #    survive into codegen and the backend can emit the (begin, end,
 #    landing_pad) triples. Everything else the script does is still needed,
 #    in particular unreachable->ret (a Rust panic path otherwise ends without
-#    an exit insn) and the .ksyms tagging that puts bpf_throw, the cleanup
+#    an exit insn) and the .ksyms tagging that puts bpf_unwind, the cleanup
 #    kfuncs and _Unwind_Resume into BTF.
 #  * add_ksyms.py runs with KERNEL_BTF=1, which reduces Rust type names to C
 #    identifiers; the kernel rejects the whole .BTF section otherwise.
